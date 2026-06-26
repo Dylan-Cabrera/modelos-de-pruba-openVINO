@@ -4,9 +4,9 @@ import cv2
 # Cargar tu modelo de segmentación entrenado
 model = YOLO("personas-seg_best.pt")
 
-model.export(format="openvino")
+#model.export(format="openvino")
 
-ov_model = YOLO("personas-seg_best_openvino_model/")
+#ov_model = YOLO("personas-seg_best_openvino_model/")
 
 
 # Abrir video (0 para la webcam integrada)
@@ -23,7 +23,7 @@ while True:
         break
 
     # Ejecutar la predicción (usamos stream=True para optimizar el video)
-    results = ov_model(frame, stream=True)
+    results = model(frame, stream=True)
     
     # Inicializamos una variable por si acaso no hay detecciones
     annotated_frame = frame 
