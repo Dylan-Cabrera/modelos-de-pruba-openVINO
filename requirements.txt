@@ -1,0 +1,5 @@
+ultralytics
+openvino
+pyzmq
+opencv-python
+lap>=0.5.12

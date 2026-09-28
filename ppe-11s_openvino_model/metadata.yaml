@@ -1,0 +1,29 @@
+description: Ultralytics YOLO11s model trained on /home/circulus/datasets/construction
+  safety.v2-release.yolov11/data.yaml
+author: Ultralytics
+date: '2026-09-21T21:42:34.633801-03:00'
+version: 8.4.155
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+head: Detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: helmet
+  1: no-helmet
+  2: no-vest
+  3: person
+  4: vest
+args:
+  data: null
+  batch: 1
+  fraction: 1.0
+  quantize: 16
+  nms: null
+  dynamic: false
+channels: 3
+end2end: false
