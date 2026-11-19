@@ -1,0 +1,12 @@
+# Entorno del pipeline con YOLOE (vocabulario abierto). Va en un venv aparte del de
+# requirements.txt para no mover la versión de ultralytics que usa ppe-11s.
+# Instalación (CPU): env UV_TORCH_BACKEND=cpu uv pip install -r requirements-yoloe.txt
+ultralytics>=8.4
+openvino
+pyzmq
+opencv-python
+lap>=0.5.12
+# Tokenizador del codificador de texto de YOLOE. Solo se usa al fijar las clases
+# (export_yoloe.py o un .pt con --classes); ultralytics lo instalaría solo en el primer
+# uso, pero la mini PC de la demo puede no tener red en ese momento.
+clip @ git+https://github.com/ultralytics/CLIP.git

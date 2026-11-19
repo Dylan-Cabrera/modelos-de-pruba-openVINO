@@ -31,3 +31,8 @@ Desktop.ini
 *.log
 tmp/
 temp/
+
+# YOLOE (VIS-01): pesos descargados y modelos exportados, no se versionan
+yoloe-*.pt
+mobileclip*.ts
+yoloe-*_openvino_model/

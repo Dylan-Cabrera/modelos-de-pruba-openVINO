@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import sys
 import threading
@@ -44,6 +45,43 @@ import socket
 import socketserver
 from ultralytics import YOLO
 import zmq
+
+
+# El ultralytics del venv de YOLOE (8.4.215) marca 'intel:cpu'/'intel:gpu' como obsoletos
+# y lo avisa en cada cuadro. Se siguen usando porque el venv de ppe-11s (8.4.203) solo
+# entiende ese formato; el filtro evita llenar el log del pipeline con el mismo aviso.
+class _IntelDeviceWarningFilter(logging.Filter):
+    def filter(self, record):
+        return "'device=intel:" not in record.getMessage()
+
+
+logging.getLogger("ultralytics").addFilter(_IntelDeviceWarningFilter())
+
+
+# Clases de YOLOE por defecto: el texto que se le da al modelo, no la clase que ve VORTEX.
+YOLOE_DEFAULT_CLASSES = "person,face mask,white lab coat"
+YOLOE_DEFAULT_DERIVE = "mask,coat"
+
+# Texto de la clase (YOLOE) -> clase canónica que entiende VORTEX (VORTEX-93). Con
+# ppe-11s ningún nombre cambia: "person" es el único que aparece y queda igual.
+CANONICAL_CLASSES = {
+    "person": "person",
+    "face mask": "mask",
+    "white lab coat": "coat",
+    "lab coat": "coat",
+}
+
+# Base del track_id de cada falta deducida: se suma al id de la persona. ByteTrack
+# numera desde 1 y en una corrida no llega a millones de pistas, así que el id derivado
+# no choca con uno real y es estable mientras la persona conserve el suyo.
+DERIVED_TRACK_BASE = {
+    "mask": 2_000_000,
+    "coat": 3_000_000,
+}
+
+# Una prenda pertenece a una persona si al menos esta fracción de su caja cae dentro de
+# la caja de la persona (el mismo criterio que ADR-16).
+GARMENT_OVERLAP_MIN = 0.5
 
 
 # Clase para leer la cámara en un hilo independiente (adaptada para soportar RTSP y webcams locales)
@@ -287,12 +325,111 @@ def parse_args():
         help="Límite de tasa de procesamiento en frames por segundo (default: 15.0, usar 0 para ilimitado)",
     )
     parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="Tamaño de entrada de la inferencia en píxeles (default: 640). Un modelo OpenVINO "
+        "exportado con otro tamaño usa el suyo",
+    )
+    parser.add_argument(
+        "--classes",
+        type=str,
+        default=None,
+        help="Solo YOLOE: clases en texto, separadas por coma "
+        f"(default con YOLOE: '{YOLOE_DEFAULT_CLASSES}'). En un modelo OpenVINO exportado "
+        "las clases ya vienen fijas y esta opción no las cambia",
+    )
+    parser.add_argument(
+        "--derive-missing",
+        type=str,
+        default=None,
+        help="Prendas cuya falta se deduce por persona, separadas por coma (mask, coat). "
+        f"Default: '{YOLOE_DEFAULT_DERIVE}' con YOLOE, ninguna con otros modelos; "
+        "'none' la desactiva",
+    )
+    parser.add_argument(
         "--mjpeg-port",
         type=int,
         default=8088,
         help="Puerto HTTP para transmitir video MJPEG a guardvision-front (default: 8088, usar 0 para desactivar)",
     )
     return parser.parse_args()
+
+
+def is_yoloe(model_path: str) -> bool:
+    return "yoloe" in os.path.basename(os.path.normpath(model_path)).lower()
+
+
+def exported_metadata(model_path: str) -> dict:
+    """Lee el metadata.yaml de un modelo OpenVINO exportado ({} si no hay)."""
+    meta_path = os.path.join(model_path, "metadata.yaml")
+    if not os.path.isfile(meta_path):
+        return {}
+    # El lector de YAML de ultralytics: según la versión, PyYAML no viene instalado.
+    from ultralytics.utils import YAML
+
+    return YAML.load(meta_path) or {}
+
+
+def load_yoloe_pytorch(model_path: str, classes: list):
+    """YOLOE en PyTorch, con las clases fijadas en el arranque.
+
+    Carga el codificador de texto (~254 MB) para convertir las clases en embeddings.
+    Es el camino de respaldo si la exportación a OpenVINO falla, y el que permite probar
+    otras clases sin reexportar.
+    """
+    from ultralytics import YOLOE
+
+    print(f"Cargando YOLOE en PyTorch desde: {model_path} con clases {classes}")
+    model = YOLOE(model_path)
+    model.set_classes(classes)
+    return model
+
+
+def canonical_class(raw_name: str) -> str:
+    name = raw_name.lower().strip()
+    if name in CANONICAL_CLASSES:
+        return CANONICAL_CLASSES[name]
+    return name.replace("-", "_").replace(" ", "_")
+
+
+def garment_belongs(garment_bbox, person_bbox) -> bool:
+    gx1, gy1, gx2, gy2 = garment_bbox
+    px1, py1, px2, py2 = person_bbox
+    garment_area = max(0.0, gx2 - gx1) * max(0.0, gy2 - gy1)
+    if garment_area <= 0:
+        return False
+    inter_w = max(0.0, min(gx2, px2) - max(gx1, px1))
+    inter_h = max(0.0, min(gy2, py2) - max(gy1, py1))
+    return inter_w * inter_h >= GARMENT_OVERLAP_MIN * garment_area
+
+
+def derive_missing(detections: list, garments: list, derived_class_ids: dict) -> list:
+    """Por cada persona sin la prenda, una detección no_<prenda> con su caja.
+
+    YOLOE detecta lo que hay, no lo que falta: la falta se deduce cuadro a cuadro a partir
+    de las personas y las prendas que se ven.
+    """
+    persons = [d for d in detections if d["class_name"] == "person"]
+    derived = []
+    for person in persons:
+        for garment in garments:
+            worn = any(
+                d["class_name"] == garment and garment_belongs(d["bbox"], person["bbox"])
+                for d in detections
+            )
+            if worn:
+                continue
+            derived.append(
+                {
+                    "track_id": DERIVED_TRACK_BASE[garment] + person["track_id"],
+                    "class_id": derived_class_ids[garment],
+                    "class_name": f"no_{garment}",
+                    "confidence": person["confidence"],
+                    "bbox": list(person["bbox"]),
+                }
+            )
+    return derived
 
 
 def load_openvino_model(model_path: str):
@@ -315,7 +452,11 @@ def load_openvino_model(model_path: str):
         else:
             raise FileNotFoundError(f"No se encontró el archivo de modelo: {model_path}")
     else:
-        return YOLO(model_path, task="detect")
+        # Un modelo de segmentación (YOLOE -seg) leído como "detect" interpreta los
+        # coeficientes de máscara como clases y devuelve basura: la tarea sale del
+        # metadata.yaml de la exportación. Sin metadata, "detect" como siempre.
+        task = exported_metadata(model_path).get("task", "detect")
+        return YOLO(model_path, task=task)
 
 
 def main():
@@ -350,13 +491,42 @@ def main():
     else:
         hw = args.device.lower()
 
-    # En Ultralytics los dispositivos OpenVINO se direccionan como 'intel:cpu' o 'intel:gpu'
-    device_arg = f"intel:{hw}"
-    device_name = hw.upper()
-    print(f"Hardware OpenVINO seleccionado: {device_name} ({device_arg})")
+    yoloe = is_yoloe(args.model)
+    # Un .pt de YOLOE corre en PyTorch: exportarlo solo, como se hace con los demás .pt,
+    # perdería las clases. La exportación con clases fijas es export_yoloe.py.
+    pytorch_backend = yoloe and args.model.endswith(".pt")
 
-    # 3. Cargar modelo YOLO con backend OpenVINO
-    model = load_openvino_model(args.model)
+    if pytorch_backend:
+        if hw == "gpu":
+            print("Aviso: YOLOE en PyTorch corre solo en CPU (torch CPU); --device gpu es para OpenVINO.")
+        device_arg = "cpu"
+        device_name = "CPU (PyTorch)"
+    else:
+        # En Ultralytics los dispositivos OpenVINO se direccionan como 'intel:cpu' o 'intel:gpu'
+        device_arg = f"intel:{hw}"
+        device_name = hw.upper()
+    print(f"Hardware seleccionado: {device_name} ({device_arg})")
+
+    # 3. Cargar el modelo
+    if args.classes is not None and not yoloe:
+        print("Aviso: --classes es solo para YOLOE; se ignora con este modelo.")
+    if pytorch_backend:
+        classes_text = args.classes if args.classes is not None else YOLOE_DEFAULT_CLASSES
+        classes = [c.strip() for c in classes_text.split(",") if c.strip()]
+        model = load_yoloe_pytorch(args.model, classes)
+        imgsz = args.imgsz
+    else:
+        if yoloe and args.classes is not None:
+            print("Aviso: el modelo OpenVINO trae las clases fijas de la exportación; --classes no las cambia.")
+        model = load_openvino_model(args.model)
+        ov_dir = args.model if os.path.isdir(args.model) else os.path.splitext(args.model)[0] + "_openvino_model"
+        # La exportación es de tamaño fijo: otro --imgsz no correría.
+        meta_imgsz = exported_metadata(ov_dir).get("imgsz")
+        imgsz = args.imgsz
+        if meta_imgsz and int(meta_imgsz[0]) != args.imgsz:
+            imgsz = int(meta_imgsz[0])
+            print(f"Aviso: {ov_dir} está exportado a {imgsz}; se usa {imgsz} en vez de --imgsz {args.imgsz}.")
+    print(f"Tamaño de entrada: {imgsz}")
 
     # 4. Determinar fuente de captura
     src = int(args.rtsp) if args.rtsp.isdigit() else args.rtsp
@@ -389,7 +559,36 @@ def main():
         tracker="bytetrack.yaml",
         verbose=False,
         device=device_arg,
+        imgsz=imgsz,
     )
+
+    # 6. Faltas deducidas por persona. Se valida después del precalentamiento, cuando el
+    # modelo ya está cargado en el dispositivo elegido y model.names es el suyo.
+    if args.derive_missing is not None:
+        derive_text = args.derive_missing
+    else:
+        derive_text = YOLOE_DEFAULT_DERIVE if yoloe else "none"
+    garments = []
+    if derive_text.strip().lower() != "none":
+        garments = [g.strip().lower() for g in derive_text.split(",") if g.strip()]
+    derived_class_ids = {}
+    if garments:
+        unknown = [g for g in garments if g not in DERIVED_TRACK_BASE]
+        if unknown:
+            print(f"Error: --derive-missing no conoce {unknown}; opciones: {sorted(DERIVED_TRACK_BASE)}.")
+            sys.exit(2)
+        model_classes = {canonical_class(n) for n in model.names.values()}
+        # Sin la clase de la prenda (o sin personas) en el modelo, cada persona saldría
+        # siempre sin ella: mejor no arrancar.
+        absent = [g for g in ["person", *garments] if g not in model_classes]
+        if absent:
+            print(f"Error: el modelo no detecta {absent} (clases: {sorted(model_classes)}); no se puede deducir la falta.")
+            sys.exit(2)
+        # class_id propio para cada falta, a continuación de los del modelo, para que no
+        # se confunda con una clase real.
+        next_id = max(model.names) + 1
+        derived_class_ids = {g: next_id + i for i, g in enumerate(garments)}
+        print(f"Falta deducida por persona: {', '.join('no_' + g for g in garments)}")
 
     print("Transmisión de video establecida. Enviando telemetría a VORTEX...")
     if args.show:
@@ -422,6 +621,7 @@ def main():
                 conf=args.conf,
                 verbose=False,
                 device=device_arg,
+                imgsz=imgsz,
             )
 
             detections = []
@@ -444,7 +644,7 @@ def main():
                     # Clase y confianza (VORTEX parsea class_name en minúsculas: "person", "helmet", "vest", etc.)
                     cls_id = int(box.cls.item())
                     raw_name = r.names.get(cls_id, str(cls_id)) if hasattr(r, "names") else str(cls_id)
-                    cls_name = raw_name.lower().strip().replace("-", "_")
+                    cls_name = canonical_class(raw_name)
                     conf = round(float(box.conf.item()), 2)
 
                     # ID de tracking asignado por ByteTrack (VORTEX requiere u64 obligatorio)
@@ -464,6 +664,9 @@ def main():
                             "bbox": bbox,
                         }
                     )
+
+            if garments:
+                detections.extend(derive_missing(detections, garments, derived_class_ids))
 
             # Estructura JSON exacta requerida por VORTEX (en espacio calibrado 1920x1080)
             payload = {

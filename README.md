@@ -65,3 +65,37 @@ python vortex_stream.py --model ppe-11s_openvino_model --source 0
 | `--mjpeg-port` | `8088` | Puerto del servidor MJPEG para el frontend |
 | `--zmq-endpoint`| `tcp://localhost:5555` | Dirección del socket ZeroMQ de VORTEX |
 | `--show` | `False` | Muestra ventana gráfica local OpenCV con detecciones |
+
+---
+
+## 🧪 YOLOE: persona, mascarilla y bata (laboratorio)
+
+YOLOE-26 es de vocabulario abierto: las clases se le dan en texto. Detecta lo que hay,
+no lo que falta, así que `vortex_stream.py` deduce la falta por persona: si ninguna
+mascarilla (o bata) tiene al menos el 50 % de su caja dentro de la caja de la persona,
+emite además `no_mask` (o `no_coat`) con la caja de la persona y `track_id`
+`2000000 + id` (o `3000000 + id`).
+
+```bash
+# Entorno aparte (no toca el de ppe-11s)
+uv venv --python 3.12 ~/.local/share/guardvision/pipeline-venv-yoloe
+UV_TORCH_BACKEND=cpu uv pip install --python ~/.local/share/guardvision/pipeline-venv-yoloe/bin/python -r requirements-yoloe.txt
+
+# Exportar a OpenVINO con las clases fijas (baja los pesos la primera vez)
+~/.local/share/guardvision/pipeline-venv-yoloe/bin/python export_yoloe.py --sizes s,m --imgsz 640
+
+# Correr (cámara, RTSP o un video grabado con --source)
+~/.local/share/guardvision/pipeline-venv-yoloe/bin/python -u vortex_stream.py \
+  --model yoloe-26s-seg-lab_openvino_model --source videos/10.mp4 --fps 10 --device gpu
+```
+
+| Parámetro | Default | Descripción |
+|---|---|---|
+| `--classes` | `person,face mask,white lab coat` (YOLOE) | Clases en texto. Solo cambia algo con el `.pt` (PyTorch); el modelo OpenVINO trae las de la exportación |
+| `--derive-missing` | `mask,coat` con YOLOE, nada con otros modelos | Faltas deducidas por persona; `none` las apaga |
+| `--imgsz` | `640` | Tamaño de entrada. Un modelo OpenVINO usa el de su exportación (`export_yoloe.py --imgsz 960` crea `yoloe-26m-seg-lab-960_openvino_model`) |
+
+Texto → clase que recibe VORTEX: `person` → `person`, `face mask` → `mask`,
+`white lab coat` / `lab coat` → `coat`. Con un `.pt` de YOLOE el modelo corre en PyTorch
+(solo CPU) y fija las clases al arrancar; es el respaldo si la exportación falla.
+Los pesos (`yoloe-*.pt`, `mobileclip*.ts`) y las carpetas exportadas no se versionan.
